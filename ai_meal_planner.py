@@ -1,7 +1,7 @@
 """
 ai_meal_planner.py
 -------------------
-Mistral AI integration for the AI Nutrition Planner group project.
+Google Gemini integration for the AI Nutrition Planner group project.
 
 Public interface (the ONLY function teammates should import):
 
@@ -9,10 +9,10 @@ Public interface (the ONLY function teammates should import):
 
 Everything else in this file is a private helper.
 
-This version is defensive about environment problems: it never lets an
-import error crash the app or get swallowed silently. If Mistral can't
-be reached for ANY reason, generate_meal_plan() still returns a usable
-fallback plan plus the exact diagnostic info needed to fix the setup.
+Same defensive design as the previous Mistral version: import problems,
+API errors, and rate limits never crash the app or get silently hidden.
+If Gemini can't be reached for ANY reason, generate_meal_plan() still
+returns a usable fallback plan plus diagnostic info for the UI.
 """
 
 import os
@@ -28,14 +28,13 @@ from dotenv import load_dotenv
 # SETUP
 # ---------------------------------------------------------------------
 
-load_dotenv()  # reads MISTRAL_API_KEY from a local .env file if present
+load_dotenv()  # reads GEMINI_API_KEY from a local .env file if present
 
 logger = logging.getLogger("ai_meal_planner")
 logging.basicConfig(level=logging.INFO)
 
-MODEL_NAME = "mistral-small-latest"
-REQUEST_TIMEOUT_MS = 30_000  # 30 seconds
-MAX_RETRIES = 2
+MODEL_NAME = "gemini-3.6-flash"
+MAX_RETRIES = 0  # don't burn extra requests against a limited free-tier quota
 
 DISCLAIMER = (
     "This meal plan is AI-generated for informational purposes and is not "
@@ -44,39 +43,40 @@ DISCLAIMER = (
 )
 
 # ---------------------------------------------------------------------
-# DEFENSIVE IMPORT OF THE MISTRAL SDK
+# DEFENSIVE IMPORT OF THE GEMINI SDK
 # ---------------------------------------------------------------------
-# We never let import problems crash the module or get hidden. Whatever
-# goes wrong here is captured in MISTRAL_IMPORT_ERROR and surfaced to
-# the caller through generate_meal_plan()'s returned dict, so it shows
-# up directly in the Streamlit UI instead of a blank failure.
+# NOTE: the OLD package `google-generativeai` is deprecated. This uses the
+# current `google-genai` package (import path: `from google import genai`).
+# Install with: pip install google-genai
 
-MISTRAL_IMPORT_ERROR = None
-Mistral = None
+GEMINI_IMPORT_ERROR = None
+genai = None
+genai_types = None
 
 try:
-    from mistralai import Mistral  # noqa: F811 (intentional re-import)
+    from google import genai as _genai
+    from google.genai import types as _genai_types
+    genai = _genai
+    genai_types = _genai_types
 except Exception as e:  # broad on purpose: any failure here is diagnostic info
-    MISTRAL_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    GEMINI_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
-# SDKError's location has moved between SDK versions/releases. Try a few
-# known locations, and fall back to a plain Exception subclass rather
-# than ever crashing the whole module over this.
-SDKError = None
-if Mistral is not None:
+# The SDK's error classes live in google.genai.errors. Import defensively —
+# fall back to a plain Exception subclass rather than ever crashing the
+# whole module over this.
+APIError = None
+if genai is not None:
     try:
-        from mistralai.models.sdkerror import SDKError
+        from google.genai.errors import APIError as _APIError
+        APIError = _APIError
     except Exception:
-        try:
-            from mistralai import SDKError  # some versions expose it at top level
-        except Exception:
-            SDKError = None
+        APIError = None
 
-if SDKError is None:
-    class SDKError(Exception):
-        """Fallback stand-in used when the real SDKError class can't be
+if APIError is None:
+    class APIError(Exception):
+        """Fallback stand-in used when the real APIError class can't be
         imported. Lets the except clauses below still work uniformly."""
-        status_code = None
+        code = None
 
 
 def get_diagnostics() -> dict:
@@ -86,9 +86,9 @@ def get_diagnostics() -> dict:
     """
     return {
         "python_executable": sys.executable,
-        "mistral_sdk_available": Mistral is not None,
-        "mistral_import_error": MISTRAL_IMPORT_ERROR,
-        "api_key_present": bool(os.getenv("MISTRAL_API_KEY")),
+        "gemini_sdk_available": genai is not None,
+        "gemini_import_error": GEMINI_IMPORT_ERROR,
+        "api_key_present": bool(os.getenv("GEMINI_API_KEY")),
     }
 
 
@@ -97,31 +97,35 @@ def get_diagnostics() -> dict:
 # ---------------------------------------------------------------------
 
 def _get_client():
-    if Mistral is None:
+    if genai is None:
         raise RuntimeError(
-            f"Mistral SDK could not be imported ({MISTRAL_IMPORT_ERROR}). "
+            f"Gemini SDK could not be imported ({GEMINI_IMPORT_ERROR}). "
             f"Running under: {sys.executable}"
         )
 
-    api_key = os.getenv("MISTRAL_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "MISTRAL_API_KEY is missing. Set it in your .env file "
+            "GEMINI_API_KEY is missing. Set it in your .env file "
             "(or in Streamlit Cloud's Secrets manager)."
         )
-    return Mistral(api_key=api_key)
+    return genai.Client(api_key=api_key)
 
 
 # ---------------------------------------------------------------------
 # INTERNAL: prompt construction
 # ---------------------------------------------------------------------
 
-def _build_messages(user_data: dict, recommended_foods: list) -> list:
+def _build_prompt(user_data: dict, recommended_foods: list) -> tuple:
+    """
+    Returns (system_instruction, user_prompt) — Gemini takes system
+    instructions as a separate config field, not a chat message.
+    """
     allergies = user_data.get("allergies", []) or []
     avoid_foods = user_data.get("avoid_foods", []) or []
     meals_per_day = user_data.get("meals_per_day", 3)
 
-    system_prompt = (
+    system_instruction = (
         "You are a nutrition meal-planning assistant embedded in a student "
         "software project. You generate practical daily meal plans strictly "
         "from the nutrition targets and food pool you are given. "
@@ -193,10 +197,7 @@ def _build_messages(user_data: dict, recommended_foods: list) -> list:
         "'notes' should briefly mention any allergy/diet exclusions you applied."
     )
 
-    return [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
+    return system_instruction, user_prompt
 
 
 # ---------------------------------------------------------------------
@@ -309,43 +310,45 @@ def generate_meal_plan(user_data: dict, recommended_foods: list) -> dict:
         plan["disclaimer"] = DISCLAIMER
         return plan
 
-    messages = _build_messages(user_data, recommended_foods)
+    system_instruction, user_prompt = _build_prompt(user_data, recommended_foods)
 
     last_error = "Unknown error."
     for attempt in range(1, MAX_RETRIES + 2):
         try:
-            response = client.chat.complete(
+            response = client.models.generate_content(
                 model=MODEL_NAME,
-                messages=messages,
-                temperature=0.4,
-                response_format={"type": "json_object"},
-                timeout_ms=REQUEST_TIMEOUT_MS,
+                contents=user_prompt,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    temperature=0.4,
+                ),
             )
 
-            raw_text = response.choices[0].message.content
+            raw_text = response.text
             parsed = _extract_json(raw_text)
             parsed = _validate_shape(parsed)
             parsed["disclaimer"] = DISCLAIMER
             parsed["is_fallback"] = False
             return parsed
 
-        except SDKError as e:
-            status = getattr(e, "status_code", None)
-            if status == 401:
-                last_error = "Invalid API key."
-                logger.error("Mistral auth error: %s", e)
+        except APIError as e:
+            status = getattr(e, "code", None)
+            if status == 401 or status == 403:
+                last_error = f"Invalid API key or permission error: {e}"
+                logger.error("Gemini auth error: %s", e)
                 break
             elif status == 429:
                 last_error = "Rate limit reached."
                 logger.warning("Rate limited (attempt %s): %s", attempt, e)
                 time.sleep(5 * attempt)  # back off 5s, then 10s, etc.
             elif status and 500 <= status < 600:
-                last_error = "Mistral service error."
+                last_error = "Gemini service error."
                 logger.warning("Server error (attempt %s): %s", attempt, e)
                 time.sleep(2 * attempt)
             else:
                 last_error = f"API request failed: {e}"
-                logger.warning("SDK error (attempt %s): %s", attempt, e)
+                logger.warning("API error (attempt %s): %s", attempt, e)
 
         except (json.JSONDecodeError, ValueError) as e:
             last_error = f"Model returned invalid JSON: {e}"
