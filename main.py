@@ -776,8 +776,8 @@ elif page == "🥗 Meal Planner":
                     diag = meal_plan.get("diagnostics", {})
                     if diag:
                         st.write("**Python executable:**", diag.get("python_executable"))
-                        st.write("**Mistral SDK importable:**", diag.get("mistral_sdk_available"))
-                        st.write("**Import error:**", diag.get("mistral_import_error"))
+                        st.write("**Gemini SDK importable:**", diag.get("gemini_sdk_available"))
+                        st.write("**Import error:**", diag.get("gemini_import_error"))
                         st.write("**API key present:**", diag.get("api_key_present"))
 
             st.markdown("## 🍽️ Your Personalized Meal Plan")
